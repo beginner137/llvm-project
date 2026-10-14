@@ -75,6 +75,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -126,6 +127,9 @@ DEBUG_COUNTER(StraightLineStrengthReduceCounter, "slsr-counter",
 static cl::opt<bool>
     EnablePoisonReuseGuard("enable-poison-reuse-guard", cl::init(true),
                            cl::desc("Enable poison-reuse guard"));
+
+STATISTIC(NumSCEVCandidateBasisDifferences,
+          "Number of candidate-basis SCEV differences computed by SLSR");
 
 namespace {
 
@@ -429,6 +433,7 @@ private:
   std::unique_ptr<DominatorTree> ScrubbedDT;
   std::unique_ptr<AssumptionCache> ScrubbedAC;
   DenseMap<const Instruction *, bool> ScrubbedDisjointCache;
+  mutable unsigned NumSCEVDiffs = 0;
 
   // Map from SCEV to instructions that represent the value,
   // instructions are sorted in depth-first order.
@@ -657,6 +662,25 @@ static void unifyBitWidth(APInt &A, APInt &B) {
     B = B.sext(A.getBitWidth());
 }
 
+// Cap on the combined SCEV expression size for which SLSR will compute a
+// Base/StrideDelta difference. getMinusSCEV on huge SCEVs (GPU kernels with
+// fully unrolled addressing routinely produce them) is prohibitively expensive
+// (SCEV FoldingSet uniquing churn) and almost never yields a delta that folds
+// into an addressing mode, so skip it. Typical addressing SCEVs are a handful
+// of nodes; this only bites on pathological ones.
+static const unsigned MaxSCEVDifferenceSize = 64;
+
+// Cap on the number of Base/StrideDelta SCEV differences computed per function.
+// The candidate-basis search is quadratic, and huge functions (GPU kernels with
+// fully unrolled addressing) can otherwise burn millions of getMinusSCEV calls
+// churning the SCEV FoldingSet. Pairs are visited closest-first, so capping
+// keeps the most valuable (closest) pairs. Past the budget, candidates fall
+// back to the cheap IndexDelta (APInt) search, mirroring the pre-rewrite SLSR
+// which had no Base/StrideDelta SCEV search at all.
+static cl::opt<unsigned>
+    MaxSCEVDifferences("slsr-max-scev-differences", cl::init(4096),
+                       cl::desc("Max candidate-basis SCEV differences per function"));
+
 Value *StraightLineStrengthReduce::getDelta(const Candidate &C,
                                             const Candidate &Basis,
                                             Candidate::DKind K) const {
@@ -672,6 +696,13 @@ Value *StraightLineStrengthReduce::getDelta(const Candidate &C,
     const SCEV *BasisPart =
         (K == Candidate::BaseDelta) ? Basis.Base : Basis.StrideSCEV;
     const SCEV *CandPart = (K == Candidate::BaseDelta) ? C.Base : C.StrideSCEV;
+    if (CandPart->getExpressionSize() + BasisPart->getExpressionSize() >
+        MaxSCEVDifferenceSize)
+      return nullptr;
+    if (NumSCEVDiffs >= MaxSCEVDifferences)
+      return nullptr;
+    ++NumSCEVDiffs;
+    ++NumSCEVCandidateBasisDifferences;
     const SCEV *Diff = SE->getMinusSCEV(CandPart, BasisPart);
     return getNearestValueOfSCEV(Diff, C.Ins);
   }
@@ -938,6 +969,9 @@ auto StraightLineStrengthReduce::compressPath(Candidate &C,
     if (!isSimilar(C, *NextRoot, CurrKind))
       break;
 
+    if (CandPart->getExpressionSize() + BasisPart->getExpressionSize() >
+        MaxSCEVDifferenceSize)
+      break;
     if (auto DeltaVal =
             dyn_cast<SCEVConstant>(SE->getMinusSCEV(CandPart, BasisPart))) {
       Root = NextRoot;
